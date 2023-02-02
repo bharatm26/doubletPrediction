@@ -1,0 +1,583 @@
+---
+title: "Doublet_prediction"
+
+author: 
+  - name: "Bharat Mishra | bharat26@uab.edu | Senior Bioinformatician"
+  - name: "<https://www.uab.edu/cores/ircp/bds>"
+ 
+date: |
+      | Start Date: August 25, 2022.
+      | Updated Date: `r format(Sys.time(), '%B %d, %Y')`
+output:
+  html_document:
+    code_folding: hide
+    css: "style.css"
+    toc: true
+    toc_float: true
+    includes:
+      after_body: "U_BDS_authorship_note.html"
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+
+
+```{r loading packages, message = FALSE, warning = FALSE}
+library(Seurat)
+library(celldex)
+library(SingleR)
+library(SingleCellExperiment)
+library(clustree)
+library(patchwork)
+library(DT)
+library(glue)
+library(ggrepel)
+library(sctransform)
+library(openxlsx)
+library(tidyverse)
+library(UCell)
+library(Matrix)
+library(DoubletFinder)
+library(knitr)
+library(scDblFinder)
+library(BiocParallel)
+library(Chord)
+library(ComplexUpset)
+
+options(dplyr.summarise.inform = FALSE)
+
+umapCellAnno <- function(seurat.obj,
+                         annotation.name = NULL,
+                         point.size = 1,
+                         label.size = 10,
+                         title = "",
+                         legend.title.size = 0,
+                         legend.text.size = 15,
+                         axis.title.x.size = 15,
+                         axis.title.y.size = 15,
+                         axis.text.y.left.size = 15,
+                         axis.text.x.bottom.size = 15,
+                         counts.as.title = FALSE,
+                         legend = TRUE,
+                         cell.legend.size = 10,
+                         counts.in.legend = TRUE,
+                         use.cols = NULL) {
+  if (!is.null(annotation.name)) {
+    vars <- annotation.name
+  } else if (!class(try(seurat.obj$Seurat_Assignment, silent = TRUE)
+  ) == "try-error") {
+    vars <- "Seurat_Assignment"
+  } else {
+    vars <- "seurat_clusters"
+  }
+  
+  umap <-
+    as_tibble(Embeddings(seurat.obj, reduction = "umap"), rownames = "Cell") %>%
+    mutate(Clusters = FetchData(seurat.obj, vars = vars)[[1]])
+  
+  cluster.counts <- umap %>%
+    group_by_at(4) %>%
+    tally() %>%
+    arrange(desc(n))
+  
+  umap$Clusters <-
+    factor(umap$Clusters , levels = cluster.counts[[1]])
+  umap <- umap[order(umap$Clusters),]
+  
+  if (is.null(use.cols)) {
+    use.cols <-
+      hcl(h = seq(15, 375, length = length(unique(umap[[4]])) + 1),
+          c = 100,
+          l = 65)[seq_along(unique(umap[[4]]))]
+  }
+  
+  if (counts.as.title == TRUE) {
+    title = paste(comma(sum(cluster.counts$n)), "Cells")
+  }
+  
+  labels <- cluster.counts[[1]]
+  if (isTRUE(counts.in.legend)) {
+    labels <-
+      as.character(glue("{cluster.counts[[1]]}\n ({cluster.counts[[2]]} Cells)"))
+    labels <- paste0(labels, "\n")
+  }
+  
+  l.coord <-
+    umap %>% group_by(Clusters) %>% summarize(UMAP1 = median(UMAP_1),
+                                              UMAP2 = median(UMAP_2))
+  
+  p1 <- ggplot(data = umap, mapping = aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = Clusters), size = point.size) +
+    scale_color_manual(values = use.cols, labels = labels) +
+    theme_bw() +
+    theme(
+      plot.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank()
+    ) +
+    theme(
+      axis.line = element_line(color = 'black'),
+      legend.title = element_text(size = legend.title.size),
+      legend.text = element_text(size = legend.text.size),
+      axis.title.x = element_text(size = axis.title.x.size),
+      axis.title.y = element_text(size = axis.title.y.size),
+      axis.text.y.left = element_text(size = axis.text.y.left.size),
+      axis.text.x.bottom = element_text(size = axis.text.x.bottom.size)
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = cell.legend.size))) +
+    geom_text_repel(
+      data = l.coord,
+      mapping = aes(x = UMAP1, y = UMAP2, label = Clusters),
+      size = label.size,
+      direction = "y"
+    )
+  
+  return(p1)
+}
+
+```
+
+
+```{r}
+deter_direc <- function(x) {
+  
+  log_names <- c("avg_logFC", "avg_log2FC", "log2FC")
+  
+  log_select <- x %>% select(any_of(log_names))
+  
+  ifelse(log_select <= 0, "down", ifelse(log_select >= 0, "up", "no_change"))
+}
+
+fromList <- function (input) {
+  # Same as original UpSetR::fromList(), but modified as shown in https://github.com/hms-dbmi/UpSetR/issues/85
+  # thanks to @docmanny
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+    x <- as.vector(match(elements, x))
+  }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names! (in this case gene names)
+  row.names(data) <- elements
+  return(data)
+}
+
+plot_output <- function(p, file_name, w_png=700, h_png=600, w_pdf=12, h_pdf=8, show_plot = TRUE){
+    
+    png(paste0(file_name,".png"), width = w_png, height = h_png)
+    plot(eval(p))
+    dev.off()
+    
+    pdf(paste0(file_name,".pdf"), width = w_pdf, height = h_pdf)
+    plot(eval(p))
+    dev.off()
+    
+    if (show_plot) {
+      plot(eval(plot))
+    }
+    
+}
+
+# for pheatmaps as it uses grid system instead of ggplot
+pheatmap_output <- function(x, file_name, w_png=900, h_png=700, w_pdf=12, h_pdf=8) {
+    
+    png(paste0(file_name,".png"), width = w_png, height = h_png)
+    
+    grid::grid.newpage()
+    grid::grid.draw(x$gtable)
+    dev.off()
+    
+    pdf(paste0(file_name,".pdf"), width = w_pdf, height = h_pdf)
+    
+    grid::grid.newpage()
+    grid::grid.draw(x$gtable)
+    dev.off()
+}
+
+nested_lapply <- function(data, FUN) {
+    lapply(data, function(sublist) { lapply(sublist, FUN) })
+}
+
+```
+
+
+## map data folder
+
+```{r}
+data_folders <- list.dirs(path = "secondary_analysis_outputs", recursive = FALSE)
+
+meta_data <- tibble(data_folders,
+                    Samples = str_replace(data_folders, "secondary_analysis_outputs/", "")) |> 
+    mutate(Sample_Name = case_when(
+            Samples == "Day1_output" ~ "F_Sal",
+            Samples == "Day2_output" ~ "F_coc",
+            Samples == "Day3_output" ~ "M_Sal",
+            Samples == "Day4_output" ~ "M_coc"),
+           Sex = case_when(
+               str_detect(Samples, "Day1_output") ~ "Female",
+               str_detect(Samples, "Day2_output") ~ "Female",
+               str_detect(Samples, "Day3_output") ~ "Male",
+               str_detect(Samples, "Day4_output") ~ "Male"),
+           Aliquot_Type = case_when(
+               str_detect(Samples, "Day1_output") ~ "Saline",
+               str_detect(Samples, "Day2_output") ~ "Cocaine",
+               str_detect(Samples, "Day3_output") ~ "Saline",
+               str_detect(Samples, "Day4_output") ~ "Cocaine",
+           ))
+
+meta_data |> 
+    knitr::kable()
+```
+
+
+## Data Import and Quality Control
+
+To begin the analysis, CellRanger output will be loaded into the local environment using the Read10X function within the Seurat package. For this dataset, 4 GEM wells were utlized, one well for each Sex and treatment group.
+
+```{r Read10X}
+
+# the 10x hdf5 file contains both data types.
+data10x <- sort(paste0(list.dirs("./secondary_analysis_outputs", recursive = FALSE),"/outs/filtered_feature_bc_matrix"))
+data10x
+
+##Read 10X hdf5 files
+N_objs_counts <- lapply(setNames(data10x,
+                                 make.names(c("Female_Saline", "Female_cocaine", "Male_Saline", "Male_cocaine"))),
+               Read10X)
+```
+
+A Seurat object is essential to the following analysis. This object will contain raw data, log-normalized data, cellular identities, and other essential information. To create this object, the CreateSeuratObject function within the Seurat package will be used. This function provides two important options when creating the object, min.cells and min.features. These options provide some intital quality control in which genes that are not within a specified number of cells, or cells that do not have a specified number of features are dropped from further analysis. Here, these options will not be utilized as cells will be dropped from the analysis at a later step.
+
+
+```{r CreateSeuratObject}
+seurat_obj_list <- N_objs_counts %>%
+    map2(meta_data$Samples, ~ CreateSeuratObject(counts = .x, project = .y, assay = "RNA", min.cells = 3, min.features = 200))
+```
+
+# QC
+An important step within single cell RNA-sequencing analysis is removing cells with a high percentage of reads mapping to the mitochondrial genome. A high percentage of cells mapping to the mitochondrial genome is indicative of poor cell health. Here, the PercentageFeatureSet command will be used to calculate the percentage of total reads mapping to the mitochondrial genome. This function will create a feature called percent_mito within each Seurat object.
+
+```{r PercentageFeatureSet}
+seurat_obj_list <- map(seurat_obj_list, ~ PercentageFeatureSet(.x, pattern = "^Mt-", col.name = "percent_mt"))
+
+map(seurat_obj_list, ~
+        (FeatureScatter(.x, feature1 = "nCount_RNA", feature2 = "percent_mt") +
+            scale_x_continuous(labels = scales::comma)) +
+        FeatureScatter(.x, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+            scale_x_continuous(labels = scales::comma))
+```
+```{r}
+map_dfr(seurat_obj_list, ~ FetchData(.x, vars = c("nFeature_RNA")) |> 
+         as_tibble() |> 
+         mutate(Sample = Project(.x))) |>  
+    group_by(Sample) |> 
+    summarize(`nFeature_RNA 97.5%` = quantile(nFeature_RNA, probs = .975)) |>  
+    knitr::kable()
+```
+
+PreQC, the distribution of number of genes and percentage of total reads mapping to the mitochondrial genome can be visualized with a violin plot. 
+```{r VlnPlot,fig.align="center"}
+qc_df <- map_dfr(seurat_obj_list, ~ tibble(Percent_MT = .x$percent_mt,
+                                  nCount_RNA = .x$nCount_RNA,
+                                  nFeature_RNA = .x$nFeature_RNA,
+                                  Sample = .x$orig.ident)) 
+
+
+plot_QC <- \(y_axis) {
+    y_axis <- substitute(y_axis)
+    qc_df |> 
+        ggplot(aes(x = Sample, y = {{y_axis}}, fill = Sample)) +
+        geom_violin() +
+        geom_jitter(size = .001) +
+        theme_bw()
+}
+
+pf1 <- plot_QC(y_axis = Percent_MT)
+pf2 <- plot_QC(y_axis = nCount_RNA)
+pf3 <- plot_QC(y_axis = nFeature_RNA)
+pf1
+pf2
+pf3
+
+```
+
+```{r}
+MT_preFil<- map_dfr(seurat_obj_list, ~ FetchData(.x, vars = c("orig.ident", "nCount_RNA", "nFeature_RNA",
+                                       "percent_mt"))) |> 
+    ggplot(aes(x = nCount_RNA, y = nFeature_RNA, color = percent_mt)) +
+  	geom_point() + 
+	scale_colour_gradient(low = "grey90", high = "black", limits = c(0,100)) +
+  	stat_smooth(method = lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~orig.ident, scales = "free") +
+    theme_classic()
+MT_preFil
+
+```
+# QC filter
+
+```{r, echo=FALSE}
+cell_count_table <- tibble(Sample_names = names(seurat_obj_list),
+       Cells_Before_Filtering = map_dbl(seurat_obj_list, ~ length(Cells(.x))),
+       Cells_After_Filter_MT = map_dbl(seurat_obj_list, ~ length(Cells(subset(.x, subset = percent_mt < 10)))),
+       Cells_After_Filter_nCount_RNA = map_dbl(seurat_obj_list, ~ length(Cells(subset(.x, subset = nCount_RNA < 30000)))),
+       Cells_After_Filter_nFeature_RNA = map_dbl(seurat_obj_list, ~ length(Cells(subset(.x, subset = nFeature_RNA < 5000)))),
+       Cells_After_Filter_MT_nCount_and_nFeature = map_dbl(seurat_obj_list, ~ length(Cells(subset(.x, subset = percent_mt < 10 & nCount_RNA < 30000 & nFeature_RNA < 5000))))) 
+
+DT::datatable(cell_count_table, (options = list (scrollX = TRUE)),
+              rownames = FALSE)
+
+cell_count_table <- cell_count_table[-1] #now remove sample names for colsum below
+
+colSums(cell_count_table) |> 
+    enframe() |> 
+    pivot_wider(names_from = name, values_from = value) |> 
+    DT::datatable((options = list (scrollX = TRUE)),
+              rownames = FALSE)
+
+
+seurat_obj_list <- map(seurat_obj_list, ~ subset(.x, subset = percent_mt < 10 & nCount_RNA < 30000 & nFeature_RNA < 5000))
+
+```
+
+```{r}
+MT_postFil<- map_dfr(seurat_obj_list, ~ FetchData(.x, vars = c("orig.ident", "nCount_RNA", "nFeature_RNA",
+                                       "percent_mt"))) |> 
+    ggplot(aes(x = nCount_RNA, y = nFeature_RNA, color = percent_mt)) +
+  	geom_point() + 
+	scale_colour_gradient(low = "grey90", high = "black", limits = c(0,100)) +
+  	stat_smooth(method = lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~orig.ident, scales = "free") +
+    theme_classic()
+MT_postFil
+```
+
+# DOUBLETS prediction Tools:
+doubletFinder, Chord, Scrublet, DoubletDecon, DoubletDetection, Solo, scds, scDblFinder
+
+for benchmarking follow: https://www.sciencedirect.com/science/article/pii/S2405471220304592
+
+## doubletFinder: preProcess
+
+```{r Log Normalization}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    seurat_obj_list <- NormalizeData(seurat_obj_list[[y]], normalization.method = "LogNormalize", scale.factor = 10000)
+
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+
+```
+
+```{r FindVariableFeatures}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    seurat_obj_list <- FindVariableFeatures(seurat_obj_list[[y]], selection.method = "vst", nfeatures = 2000)
+    
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+
+```
+
+```{r ScaleData}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    seurat_obj_list <- ScaleData(seurat_obj_list[[y]],verbose = FALSE)
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+```{r RunPCA}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    seurat_obj_list <- RunPCA(seurat_obj_list[[y]],npcs = 17 ,verbose = FALSE)
+
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+```{r RunUMAP}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+
+    seurat_obj_list <- RunUMAP(seurat_obj_list[[y]], reduction = "pca", dims = 1:17)
+
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+```{r FindNeighbors}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    seurat_obj_list <- FindNeighbors(seurat_obj_list[[y]], reduction = "pca", dims = 1:17)
+    
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+```{r FindCluster}
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    seurat_obj_list <- FindClusters(seurat_obj_list[[y]], resolution = 0.2)
+
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+## doubletfinder: RNA assay
+```{r }
+seurat_obj_list <- mapply(FUN = function(x,y) {
+  
+    nExp_poi <- round(0.03*nrow(seurat_obj_list[[y]]@meta.data))  ## Assuming 3% doublet formation rate
+    seurat_obj_list <- doubletFinder_v3(seurat_obj_list[[y]],
+            PCs = 1:17, 
+            pN = 0.3, 
+            pK = 0.27, 
+            nExp = nExp_poi,
+            reuse.pANN = FALSE, 
+            sct = FALSE)
+    
+    return(seurat_obj_list)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+## add metadata and Doubleetfinder colnames
+```{r}
+seurat_obj_list$Female_Saline$doublets <- as.character(seurat_obj_list$Female_Saline$DF.classifications_0.3_0.27_108 =="Doublet")
+seurat_obj_list$Female_cocaine$doublets <- as.character(seurat_obj_list$Female_cocaine$DF.classifications_0.3_0.27_146 =="Doublet")
+seurat_obj_list$Male_Saline$doublets <- as.character(seurat_obj_list$Male_Saline$DF.classifications_0.3_0.27_115 =="Doublet")
+seurat_obj_list$Male_cocaine$doublets <- as.character(seurat_obj_list$Male_cocaine$DF.classifications_0.3_0.27_94 =="Doublet")
+
+
+DFinderList <- mapply(FUN = function(x,y) {
+  Idents(object = seurat_obj_list[[y]]) <- "doublets"
+  seurat_obj_list[[y]] <- subset(seurat_obj_list[[y]], idents = "TRUE", invert = F)
+  DFinderList <- list(colnames(seurat_obj_list[[y]]))
+    
+    return(DFinderList)
+
+}, x=seurat_obj_list, y=names(seurat_obj_list))
+```
+
+
+
+## Chord
+## gbm/default method
+
+```{r }
+seurat_obj_list_douGBM <- map(seurat_obj_list, ~ chord(seu = .x,
+          method = "gbm",
+          doubletrate=0.03,
+          k=20,
+          overkill=T,
+          overkillrate=1,
+          seed=1))
+```
+
+
+## with adaboost method
+```{r, echo=FALSE, message=FALSE}
+seurat_obj_list_douADA <- map(seurat_obj_list, ~ chord(seu = .x,
+          method = "adaboost",
+          doubletrate=0.03,
+          k=20,
+          overkill=T,
+          overkillrate=1,
+          outname="out",
+          seed=1))
+```
+
+
+## UpSet Plots
+
+
+```{r, echo=FALSE}
+all_results <- list(
+  DoubletFinder = DFinderList,
+  ChordGBM = seurat_obj_list_douGBM,
+  ChordADABOOST = seurat_obj_list_douADA
+)
+
+Samples_in_obj <- sort(as.character(names(seurat_obj_list)))
+
+```
+
+```{r, echo=FALSE}
+dir.create("results", recursive = TRUE, showWarnings = FALSE)
+
+all_plots <- mapply(FUN = function(x,y) {
+  
+  # make binary for each plot per CellType and plot
+  by_samples <- fromList(list(DoubletFinder = all_results$DoubletFinder[[y]],
+                              ChordGBM = all_results$ChordGBM[[y]],
+                              ChordADABOOST = all_results$ChordADABOOST[[y]]))
+  
+  
+  # not all cell types will have DEGs in any dataset, thus do not plot these cell types:
+
+  if (nrow(by_samples >=1)) {
+
+    # write outputs as it has gene names if interested
+    write.csv(by_samples, paste0("results/genes_for_UpsetR_", x, ".csv"))
+
+    #plot
+    Upset_plot <- ComplexUpset::upset(by_samples,
+                                      intersect = names(all_results),
+                                      wrap = TRUE,
+                                      base_annotations=list(
+                                        'Intersection size'=intersection_size(
+                                          counts=TRUE))) + ggtitle(paste0("Number of doublets in: ", x))
+
+    return(Upset_plot)
+
+  }
+  
+}, x = sort(make.names(Samples_in_obj)), y = 1:length(Samples_in_obj), SIMPLIFY = FALSE)
+
+```
+
+```{r}
+a1 <- all_plots$Female_Saline
+a2 <- all_plots$Female_cocaine
+a3 <- all_plots$Male_Saline
+a4 <- all_plots$Male_cocaine
+a1
+a2
+a3
+a4
+
+```
+
+
+# SESSION_INFO:
+
+```{r, eval=FALSE}
+sessionInfo()
+```
+
+
+
+
